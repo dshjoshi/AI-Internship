@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from openai import OpenAI
 from pydantic import BaseModel, Field, ValidationError
 
-from vectorstore import pinecone_health
+from vectorstore import pinecone_health, query_similar, upsert_document
 
 # Load .env from this folder so the key is found regardless of shell working directory.
 _ENV_PATH = Path(__file__).resolve().parent / ".env"
@@ -53,6 +53,20 @@ class AskResponse(BaseModel):
     model: str
     latency_ms: int
     cost_usd: float
+
+
+class IngestRequest(BaseModel):
+    """One document to chunk, embed, and upsert into the vector store."""
+
+    document_id: str
+    text: str
+    source: str | None = None  # e.g. original filename
+
+
+class IngestResponse(BaseModel):
+    document_id: str
+    chunks_indexed: int
+    status: str
 
 
 def compute_cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -> float:
@@ -125,6 +139,39 @@ def health_pinecone() -> dict:
     if not result["ok"]:
         raise HTTPException(status_code=503, detail=result)
     return result
+
+
+@app.post("/ingest")
+def ingest(body: IngestRequest) -> IngestResponse:
+    """
+    Chunk, embed, and upsert one document into Pinecone.
+
+    curl -s -X POST http://127.0.0.1:8000/ingest \
+      -H "Content-Type: application/json" \
+      -d '{"document_id": "doc1", "text": "Retrieval-Augmented Generation combines a retriever with an LLM.", "source": "notes.txt"}'
+    """
+
+    if not body.document_id.strip():
+        raise HTTPException(status_code=400, detail="document_id must not be empty")
+    if not body.text.strip():
+        raise HTTPException(status_code=400, detail="text must not be empty")
+
+    chunks_indexed = upsert_document(body.document_id, body.text, body.source)
+    return IngestResponse(document_id=body.document_id, chunks_indexed=chunks_indexed, status="success")
+
+
+@app.get("/debug/retrieve")
+def debug_retrieve(q: str) -> dict:
+    """
+    Retrieval-only debug route — embeds the query and returns top-5 chunks. No LLM call.
+
+    curl -s "http://127.0.0.1:8000/debug/retrieve?q=What%20is%20chunking%3F"
+    """
+
+    if not q.strip():
+        raise HTTPException(status_code=400, detail="q must not be empty")
+
+    return {"query": q, "results": query_similar(q, top_k=5)}
 
 
 @app.post("/ask")

@@ -1,5 +1,6 @@
 fastapi[standard]
 httpx
+langchain-text-splitters
 openai
 pinecone
 python-dotenv

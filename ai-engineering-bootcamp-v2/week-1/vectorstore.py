@@ -2,12 +2,17 @@
 
 import os
 
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from openai import OpenAI
 from pinecone import Pinecone
 
 # Single source of truth so ingest and query can never drift onto different models or sizes.
 EMBEDDING_MODEL = "text-embedding-3-small"
 EMBEDDING_DIMENSION = 1024  # truncated from the model's native 1536 to match the "glorious-palm" Pinecone index
+
+# Chunking — env-configurable like the rest of this app's settings, with the requested defaults.
+CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "800"))
+CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "100"))
 
 _pinecone_client: Pinecone | None = None
 _openai_client: OpenAI | None = None
@@ -39,6 +44,53 @@ def embed_text(text: str) -> list[float]:
         model=EMBEDDING_MODEL, input=text, dimensions=EMBEDDING_DIMENSION
     )
     return response.data[0].embedding
+
+
+def chunk_text(text: str) -> list[str]:
+    """Split one document's text into overlapping chunks using CHUNK_SIZE / CHUNK_OVERLAP."""
+    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+    return splitter.split_text(text)
+
+
+def upsert_document(document_id: str, text: str, source: str | None) -> int:
+    """Chunk, embed, and upsert one document into Pinecone. Returns the number of chunks indexed."""
+    chunks = chunk_text(text)
+
+    vectors = [
+        {
+            "id": f"{document_id}-{i}",
+            "values": embed_text(chunk),
+            "metadata": {
+                "document_id": document_id,
+                "chunk_index": i,
+                "source": source or "",
+                "text": chunk,  # kept so a later /ask query can show what was actually retrieved
+            },
+        }
+        for i, chunk in enumerate(chunks)
+    ]
+
+    if vectors:
+        get_index().upsert(vectors=vectors)
+    return len(vectors)
+
+
+def query_similar(query_text: str, top_k: int = 5) -> list[dict]:
+    """Embed a query and return its top-k nearest chunks — retrieval only, no LLM call."""
+    matches = get_index().query(
+        vector=embed_text(query_text), top_k=top_k, include_metadata=True
+    )["matches"]
+
+    return [
+        {
+            "score": match["score"],
+            "document_id": match["metadata"].get("document_id"),
+            "chunk_index": match["metadata"].get("chunk_index"),
+            "source": match["metadata"].get("source"),
+            "text": match["metadata"].get("text"),
+        }
+        for match in matches
+    ]
 
 
 def pinecone_health() -> dict:
