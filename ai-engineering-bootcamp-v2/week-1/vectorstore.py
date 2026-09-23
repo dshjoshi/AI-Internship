@@ -52,6 +52,11 @@ def chunk_text(text: str) -> list[str]:
     return splitter.split_text(text)
 
 
+# Pinecone rejects any single upsert request over 4MB; 100 vectors/batch stays safely under
+# that regardless of metadata text length.
+UPSERT_BATCH_SIZE = 100
+
+
 def upsert_chunks(document_id: str, chunks: list[str], source: str | None) -> int:
     """Embed and upsert a pre-made list of chunks under one document_id. Returns the count."""
     vectors = [
@@ -68,8 +73,11 @@ def upsert_chunks(document_id: str, chunks: list[str], source: str | None) -> in
         for i, chunk in enumerate(chunks)
     ]
 
-    if vectors:
-        get_index().upsert(vectors=vectors)
+    index = get_index()
+    for start in range(0, len(vectors), UPSERT_BATCH_SIZE):
+        batch = vectors[start : start + UPSERT_BATCH_SIZE]
+        if batch:
+            index.upsert(vectors=batch)
     return len(vectors)
 
 
@@ -86,6 +94,7 @@ def query_similar(query_text: str, top_k: int = 5) -> list[dict]:
 
     return [
         {
+            "id": match["id"],
             "score": match["score"],
             "document_id": match["metadata"].get("document_id"),
             "chunk_index": match["metadata"].get("chunk_index"),

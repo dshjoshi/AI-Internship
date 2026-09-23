@@ -1,5 +1,6 @@
 """Week 1 live demo — five stages in one file, built up live in class."""
 
+import os
 import time
 from pathlib import Path
 
@@ -8,7 +9,7 @@ from fastapi import FastAPI, HTTPException
 from openai import OpenAI
 from pydantic import BaseModel, Field, ValidationError
 
-from vectorstore import pinecone_health, query_similar, upsert_document
+from vectorstore import pinecone_health, query_similar, upsert_chunks, upsert_document
 
 # Load .env from this folder so the key is found regardless of shell working directory.
 _ENV_PATH = Path(__file__).resolve().parent / ".env"
@@ -20,6 +21,9 @@ client = OpenAI()  # Reads OPENAI_API_KEY from the environment; never hardcode k
 
 # Stage 4 default — strong general model; swap at request time for the live demo.
 DEFAULT_MODEL = "gpt-4o"
+
+# RAG — how many chunks to retrieve per question; env-configurable like the rest of this app.
+RETRIEVAL_TOP_K = int(os.environ.get("RETRIEVAL_TOP_K", "5"))
 
 # Stage 5 — per-1K-token input/output USD (derived from OpenAI list prices).
 MODEL_PRICES_PER_1K: dict[str, tuple[float, float]] = {
@@ -53,13 +57,19 @@ class AskResponse(BaseModel):
     model: str
     latency_ms: int
     cost_usd: float
+    retrieved_chunk_ids: list[str]
 
 
 class IngestRequest(BaseModel):
-    """One document to chunk, embed, and upsert into the vector store."""
+    """One document to embed and upsert into the vector store.
+
+    Provide either `text` (auto-chunked via CHUNK_SIZE/CHUNK_OVERLAP) or a
+    pre-made `chunks` list (used as-is, one vector per entry) — not both.
+    """
 
     document_id: str
-    text: str
+    text: str | None = None
+    chunks: list[str] | None = None
     source: str | None = None  # e.g. original filename
 
 
@@ -75,6 +85,29 @@ def compute_cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -> 
     prices = MODEL_PRICES_PER_1K.get(model, MODEL_PRICES_PER_1K[DEFAULT_MODEL])
     input_per_1k, output_per_1k = prices
     return (prompt_tokens / 1000 * input_per_1k) + (completion_tokens / 1000 * output_per_1k)
+
+
+def build_grounding_prompt(question: str, chunks: list[dict]) -> str:
+    """RAG prompt: answer only from retrieved context, cite document_id, refuse if insufficient."""
+
+    if chunks:
+        context_block = "\n\n".join(
+            f"[{i + 1}] (document_id: {c['document_id']}) {c['text']}" for i, c in enumerate(chunks)
+        )
+    else:
+        context_block = "(no matching context was found)"
+
+    return (
+        "You are a question-answering assistant that must ground every answer strictly in the "
+        "CONTEXT below. Do not use outside knowledge, even if you already know the answer.\n\n"
+        f"CONTEXT:\n{context_block}\n\n"
+        f"QUESTION: {question}\n\n"
+        "Instructions:\n"
+        "- Answer using ONLY information found in the CONTEXT above.\n"
+        "- For every fact you state, cite the document_id it came from, like (source: <document_id>).\n"
+        "- If the CONTEXT does not contain enough information to answer the question, do not guess — "
+        "say so explicitly in your answer and set sources_needed to true."
+    )
 
 
 def call_model_structured(question: str, model: str) -> tuple[Answer, int, int, int]:
@@ -144,19 +177,31 @@ def health_pinecone() -> dict:
 @app.post("/ingest")
 def ingest(body: IngestRequest) -> IngestResponse:
     """
-    Chunk, embed, and upsert one document into Pinecone.
+    Chunk (or use pre-made chunks), embed, and upsert one document into Pinecone.
 
+    Auto-chunked from raw text:
     curl -s -X POST http://127.0.0.1:8000/ingest \
       -H "Content-Type: application/json" \
       -d '{"document_id": "doc1", "text": "Retrieval-Augmented Generation combines a retriever with an LLM.", "source": "notes.txt"}'
+
+    Pre-made chunks (one vector per entry, no splitting):
+    curl -s -X POST http://127.0.0.1:8000/ingest \
+      -H "Content-Type: application/json" \
+      -d '{"document_id": "doc1", "chunks": ["row one text", "row two text"], "source": "notes.csv"}'
     """
 
     if not body.document_id.strip():
         raise HTTPException(status_code=400, detail="document_id must not be empty")
-    if not body.text.strip():
-        raise HTTPException(status_code=400, detail="text must not be empty")
 
-    chunks_indexed = upsert_document(body.document_id, body.text, body.source)
+    if body.chunks is not None:
+        if not any(chunk.strip() for chunk in body.chunks):
+            raise HTTPException(status_code=400, detail="chunks must not be empty")
+        chunks_indexed = upsert_chunks(body.document_id, body.chunks, body.source)
+    else:
+        if not body.text or not body.text.strip():
+            raise HTTPException(status_code=400, detail="text must not be empty")
+        chunks_indexed = upsert_document(body.document_id, body.text, body.source)
+
     return IngestResponse(document_id=body.document_id, chunks_indexed=chunks_indexed, status="success")
 
 
@@ -176,10 +221,14 @@ def debug_retrieve(q: str) -> dict:
 
 @app.post("/ask")
 def ask(body: AskRequest) -> AskResponse:
-    """Answer one question with structured output, guardrails, and cost visibility."""
+    """Answer one question with retrieval-augmented generation, guardrails, and cost visibility."""
 
     model = body.model or DEFAULT_MODEL
     last_error: str | None = None
+
+    retrieved = query_similar(body.question, top_k=RETRIEVAL_TOP_K)
+    retrieved_chunk_ids = [chunk["id"] for chunk in retrieved]
+    grounding_prompt = build_grounding_prompt(body.question, retrieved)
 
     # Stage 3: one retry keeps the logic legible while still protecting callers.
     for attempt in range(2):
@@ -190,11 +239,11 @@ def ask(body: AskRequest) -> AskResponse:
             use_bad_path = body.force_bad and attempt == 0
             if use_bad_path:
                 answer, tokens_used, prompt_tokens, completion_tokens = call_model_unsafe(
-                    body.question, model
+                    grounding_prompt, model
                 )
             else:
                 answer, tokens_used, prompt_tokens, completion_tokens = call_model_structured(
-                    body.question, model
+                    grounding_prompt, model
                 )
 
             latency_ms = int((time.perf_counter() - start) * 1000)
@@ -206,6 +255,7 @@ def ask(body: AskRequest) -> AskResponse:
                 model=model,
                 latency_ms=latency_ms,
                 cost_usd=round(cost_usd, 6),
+                retrieved_chunk_ids=retrieved_chunk_ids,
             )
         except (ValidationError, ValueError) as exc:
             last_error = str(exc)
