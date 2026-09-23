@@ -8,6 +8,8 @@ from fastapi import FastAPI, HTTPException
 from openai import OpenAI
 from pydantic import BaseModel, Field, ValidationError
 
+from vectorstore import pinecone_health
+
 # Load .env from this folder so the key is found regardless of shell working directory.
 _ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(_ENV_PATH)
@@ -113,6 +115,16 @@ def call_model_unsafe(question: str, model: str) -> tuple[Answer, int, int, int]
     prompt_tokens = usage.prompt_tokens if usage else 0
     completion_tokens = usage.completion_tokens if usage else 0
     return answer, total, prompt_tokens, completion_tokens
+
+
+@app.get("/health/pinecone")
+def health_pinecone() -> dict:
+    """Debug endpoint — confirms Pinecone is reachable and the index is usable."""
+
+    result = pinecone_health()
+    if not result["ok"]:
+        raise HTTPException(status_code=503, detail=result)
+    return result
 
 
 @app.post("/ask")
