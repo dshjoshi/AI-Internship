@@ -52,10 +52,8 @@ def chunk_text(text: str) -> list[str]:
     return splitter.split_text(text)
 
 
-def upsert_document(document_id: str, text: str, source: str | None) -> int:
-    """Chunk, embed, and upsert one document into Pinecone. Returns the number of chunks indexed."""
-    chunks = chunk_text(text)
-
+def upsert_chunks(document_id: str, chunks: list[str], source: str | None) -> int:
+    """Embed and upsert a pre-made list of chunks under one document_id. Returns the count."""
     vectors = [
         {
             "id": f"{document_id}-{i}",
@@ -73,6 +71,11 @@ def upsert_document(document_id: str, text: str, source: str | None) -> int:
     if vectors:
         get_index().upsert(vectors=vectors)
     return len(vectors)
+
+
+def upsert_document(document_id: str, text: str, source: str | None) -> int:
+    """Chunk (via CHUNK_SIZE/CHUNK_OVERLAP), embed, and upsert one document. Returns chunk count."""
+    return upsert_chunks(document_id, chunk_text(text), source)
 
 
 def query_similar(query_text: str, top_k: int = 5) -> list[dict]:
